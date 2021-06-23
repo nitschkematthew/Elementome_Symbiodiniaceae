@@ -1,0 +1,1572 @@
+---
+title: "Statistical Analysis - Micronutrient content drives “elementome” variability amongst the Symbiodiniaceae"
+author: "Emma Camp, Matthew Nitschke"
+date: "23/06/2021"
+---
+
+# Libraries
+
+```{r}
+# Libraries for plotting and being tidy
+library(tidyverse)
+library(broom)
+library(purrr)
+library(lubridate)
+library(gt)
+theme_set(theme_bw())
+library(ggpubr)
+library(ggalt)
+library(ggrepel)
+library(patchwork)
+library(GGally)
+
+# Libraries for fitting curves
+library(nls.multstart)
+library(nlstools)
+
+# Libraries for multivariate analysis
+library(vegan)
+
+# Libraries for statistics
+library(rstatix)
+library(bestNormalize)
+library(cluster)
+library(NbClust)
+library(factoextra)
+```
+
+# Data import and cleaning
+
+## Elementome and cell trait data import
+
+```{r}
+elementome_abs <- read_csv("Final Metadatafiles/complete_sample_metadata_plus_variables_absoluteconcentration.csv") %>%
+    mutate(sample_id = paste0(culture_id, "_", str_remove_all(date, "\\."))) %>%
+    mutate(temperature = factor(as.character(temperature))) %>% # Create a categorical temp variable
+    mutate(strain_volume_sqrt = sqrt(strain_volume)) %>%
+    mutate(gr_log = log(growth_rate)) %>%
+    mutate(C_N_ratio = C/N) %>%
+    mutate(N_P_ratio = N/P31) %>%
+    mutate(C_N_P_ratio = paste0(round(C, digits = 2),":", round(N, digits = 2),":", round(P31, digits = 2))) %>%
+    mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+    select(-culture_id_1)
+
+elementome_mmolEtoP <- read_csv("Final Metadatafiles/complete_sample_metadata_plus_variables_mmolEtoP.csv") %>%
+    mutate(sample_id = paste0(culture_id, "_", str_remove_all(date, "\\."))) %>%
+    mutate(temperature = factor(as.character(temperature))) %>% # Create a categorical temp variable
+    mutate(strain_volume_sqrt = sqrt(strain_volume)) %>%
+    mutate(gr_log = log(growth_rate)) %>%
+    mutate(C_N_ratio = C/N) %>%
+    mutate(N_P_ratio = N/P31) %>%
+    mutate(C_N_P_ratio = paste0(round(C, digits = 2),":", round(N, digits = 2),":", round(P31, digits = 2))) %>%
+    mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+    select(-culture_id_1)
+
+elementome_mmolEtoP_log <- elementome_mmolEtoP %>%
+  mutate(across(P31:Mo96, log)) %>% # log transform creates infinite values where 0's exist
+  mutate(across(P31:Mo96, ~na_if(., -Inf))) %>% # convert infinite values to NA
+  mutate(across(P31:Mo96, ~replace_na(., 0))) # convert NAs to 0
+
+elementome_abs_cell <- read_csv("Final Metadatafiles/complete_sample_metadata_plus_variables_per_cell_absoluteconcentration.csv") %>%
+    mutate(sample_id = paste0(culture_id, "_", str_remove_all(date, "\\."))) %>%
+    mutate(temperature = factor(as.character(temperature))) %>% # Create a categorical temp variable
+    mutate(strain_volume_sqrt = sqrt(strain_volume)) %>%
+    mutate(gr_log = log(growth_rate)) %>%
+    mutate(C_N_ratio = C/N) %>%
+    mutate(N_P_ratio = N/P31) %>%
+    mutate(C_N_P_ratio = paste0(round(C, digits = 2),":", round(N, digits = 2),":", round(P31, digits = 2))) %>%
+    mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+    select(-culture_id_1)
+
+cell_volume_raw <- readxl::read_excel("Final Metadatafiles/Cell volume data raw.xlsx") %>%
+  rename(culture_id = "Strain", temperature = "Temperature") %>%
+  mutate(culture_id = case_when(culture_id == "RT161" ~ "RT61",
+                                culture_id == "Clade B" ~ "CladeB",
+                                culture_id == "D1a" ~ "UTSD",
+                                culture_id == "Hetero M" ~ "HeteroM", TRUE ~ culture_id)) %>%
+  mutate(culture_id = as.factor(culture_id)) %>%
+  mutate(sample_id = paste0(culture_id, "_", str_remove_all(Date, "\\."))) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  mutate(temperature = as.factor(temperature))
+
+cell_volume_data <- cell_volume_raw %>%
+  group_by(culture_id, sample_id, temperature) %>%
+  summarise(VolumeEqSphere_um3 = mean(VolumeEqSphere_um3)) %>%
+  ungroup()
+```
+
+## Photobiology data import
+
+```{r message = FALSE, warning = FALSE}
+file_names <- list.files(getwd(), pattern = "_fit.csv", full.names = TRUE, recursive = TRUE)
+file_paths <- file.path(file_names)
+
+combined_data <- file_paths %>%
+  map(read_csv) %>% # read in all the files, using the function read_csv() from the readr package
+  map(select, `Source DataFile`:QBP_Size) %>% 
+  reduce(rbind) %>%      # reduce with rbind into one dataframe
+  filter(!str_detect(DATE, "---")) %>% # Remove the pointless line below the column names
+  rename(sample_filename = `Source DataFile`) # Make column header R friendly
+```
+
+### Create metadata
+
+```{r}
+meta <- data.frame(sample_filename = unique(combined_data$sample_filename))
+# write.csv(meta, "sample_metadata.csv")
+
+# Populate sample_metadata.csv with sample metadata (genus, strain, etc)
+complete_sample_metadata <- read_csv("complete_sample_metadata.csv") %>%
+      mutate(sample_id = paste0(culture_id, "_", str_remove_all(date, "\\.")))
+
+elementome_abs <- left_join(elementome_abs, complete_sample_metadata %>% select(-temperature))
+elementome_abs_cell <- left_join(elementome_abs_cell, complete_sample_metadata %>% select(-temperature))
+elementome_mmolEtoP <- left_join(elementome_mmolEtoP, complete_sample_metadata %>% select(-temperature))
+```
+
+### Join metadata with all data
+
+```{r}
+all_data <- left_join(combined_data, complete_sample_metadata) %>%
+  rename(PAR = Light_1, FqFm = `Fv/Fm`)
+```
+
+### Raw Soliense data notes
+
+```{r}
+# All data on 08.11.19 only go to PAR values of 750 and then a full cycle of dark. All other data is filtered above 750 umols to match.
+# SCF805804 on 10.12.19 have three dark values at the beginning that do not match the following time sequence. Removed.
+# CCMP3420 on 13.11.19 has an extra dark value somewhere in the first dark sequence. These initial dark values are sliced out during selection of steady state values so no need to address.
+```
+
+### Clean the data
+
+```{r}
+data_ss <- all_data %>%
+  filter(!str_detect(sample_filename, "PVB18B_17.12.2019_data.csv|PVB18B_18.12.2019_data.csv|UTS_D_17.12.2019_data.csv")) %>% # Remove samples that were repeated
+  group_by(sample_filename) %>%
+  slice(1:1799) %>%
+  mutate(PAR = floor(as.numeric(PAR)),
+         PAR = ifelse(PAR < 1, 0.1, PAR)) %>% # PAR values = 0 will result in infinite values during fitting. Replace with 0.001.
+  group_by(sample_filename, DATE, culture_id, temperature, PAR) %>%
+  #slice(tail(row_number(), 20)) %>% # Slice to keep the steady state values - last 20 (see plot below)
+  slice(80:100) %>% # Keep the middle values
+  ungroup() %>%
+  type_convert() %>%
+  mutate(PAR_factor = factor(as.character(PAR)), # Create a categorical PAR variable
+         temperature = factor(as.character(temperature))) %>%  # Create a categorical PAR variable
+  mutate(PAR_factor = fct_relevel(PAR_factor, "0.1", "10", "25", "50", "75", "100", "150", "250", "500", "750")) %>%
+  mutate(label = paste(culture_id,".",temperature,".",date)) %>%
+  group_by(sample_filename) %>%
+  slice(1:which.min(FqFm)) %>% # Stop the light curve at the minimum value
+  mutate(measurement = row_number(), # Create a measurement index
+         curve_id = group_indices()) %>% # Create a curve index
+  ungroup()
+```
+
+### Check steady state yields
+
+```{r}
+# Plot all yields to check for any data anomaly 
+data_ss %>%
+  ggplot(aes(measurement, FqFm, group = sample_filename)) +
+  geom_path(aes(colour = PAR_factor)) +
+  facet_wrap(~ label, ncol = 9, scales = "free_x") +
+  theme(aspect.ratio = 1)  +
+  ylab("Fq/Fm (dimensionless)") +
+  xlab("Measurments at each PAR step")
+
+## The yields in the temperature stressed cultures, regardless of sampling date, are inherently noisier and do not attain a steady state as quickly as the controls.
+
+## No indication of chlororespiration (i.e. yield increases after the initiation of the first light step following darkness).
+```
+
+### Figure SI-1
+
+```{r}
+all_data %>%
+    filter(!str_detect(sample_filename, "PVB18B_17.12.2019_data.csv|PVB18B_18.12.2019_data.csv|UTS_D_17.12.2019_data.csv")) %>% # Remove samples that were repeated
+  #filter(str_detect(sample_filename, "SCF05506")) %>%
+  filter(temperature == 27) %>%
+  group_by(sample_filename) %>%
+  slice(1:1799) %>%
+  mutate(PAR = floor(as.numeric(PAR)),
+         PAR = ifelse(PAR < 1, 0.1, PAR)) %>% # PAR values = 0 will result in infinite values during fitting. Replace with 0.001.
+  filter(PAR == 0.1) %>%
+  mutate(index = row_number()) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  ggplot(aes(index, as.numeric(Tau2QA))) +
+  geom_point(shape = 21, fill = "white") +
+  facet_wrap(~culture_id, nrow = 2) +
+  ylim(c(0, 8000)) +
+  annotate("rect", xmin = 80, xmax = 100, ymin = 0, ymax = max(8000), alpha = 0.5, fill = "red") +
+  theme(aspect.ratio = 1)
+```
+
+### Average the steady state Fo and Fm values and generate parameters from these
+
+```{r}
+# Average across the yields at each PAR step
+data_means <- data_ss %>%
+  group_by(sample_filename, DATE, label, genus, culture_id, temperature, PAR, PAR_factor, temp_comparison, curve_id, sample_id) %>%
+  summarise(Fo = mean(Fo),
+            Fm = mean(Fm)) %>%
+  ungroup() %>%
+    mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61"))
+
+# Calculate further parameters
+data_means <- data_means %>%
+  group_by(sample_filename, DATE, genus, culture_id, temperature, temp_comparison, curve_id, sample_id) %>%
+  mutate(Fm = ifelse(Fm <= Fo, Fo+1, Fm), # There should not be any Fm values < F
+         FqFm = (Fm - Fo)/Fm, # Quantum yield of PSII
+         rETR = FqFm * PAR, # Relative electron transport rate
+         Fo.p = first(Fo) / (first(FqFm) + (first(Fo)/Fm)), # Fo'
+         onemC = (Fm - Fo)/(Fm - Fo.p), # [1 - C]
+         Fv.p = Fm - Fo.p, # Fv'
+         onemQ = (Fv.p/Fm)/first(FqFm)) %>% # [1 - Q]  
+  ungroup()
+```
+
+# -----------
+
+# Results
+
+# -----------
+
+# Figure 1 - trait plot
+
+## Figure 1a
+
+```{r}
+pal <- c("#F8766D",	"#F8766D","#F8766D","#A3A500","#A3A500","#A3A500","#00BF7D","#00B0F6", "#E76BF3","#E76BF3")
+
+Fig1a <- elementome_mmolEtoP_log %>%
+  filter(temperature == 27) %>%
+  ggplot(aes(culture_id, growth_rate)) +
+  geom_boxplot(aes(fill = culture_id)) +
+  theme(aspect.ratio = 1, legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = pal)
+
+Fig1b <- cell_volume_data %>%
+  filter(temperature == 27) %>%
+  ggplot(aes(culture_id, VolumeEqSphere_um3)) +
+  geom_boxplot(aes(fill = culture_id)) +
+  theme(aspect.ratio = 1, legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = pal)
+  
+Q_plot <- data_means %>%
+  filter(temperature == 27) %>%
+  group_by(culture_id, genus, PAR) %>%
+  summarise(mean_onemQ = mean(onemQ),
+            mean_onemC = mean(onemC),
+            sd_onemQ = sd(onemQ),
+            sd_onemC = sd(onemC))
+
+Fig1c <- Q_plot %>%
+  ggplot(aes(mean_onemQ, mean_onemC, fill = genus, shape = culture_id, group = culture_id)) +
+  geom_path() +
+  geom_point(size = 4) +
+  geom_abline(slope = 1) +
+  scale_shape_manual(values = c(21, 22, 23, 21, 22, 23, 21, 21, 21, 22)) +
+  theme(aspect.ratio = 1, legend.position = "right") +
+  guides(shape = guide_legend(override.aes = list(fill = pal))) +
+  guides(fill = FALSE) +
+  xlab("[1 - Q] Non-photochemical quenching") +
+  ylab("[1 - C] Photochemical quenching")
+
+Fig1c_supp <- Q_plot %>%
+  ggplot(aes(mean_onemQ, mean_onemC, fill = genus, shape = culture_id, group = culture_id)) +
+  geom_path() +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = mean_onemC - sd_onemC, ymax = mean_onemC + sd_onemC)) +
+  geom_errorbarh(aes(xmin = mean_onemQ - sd_onemQ, xmax = mean_onemQ + sd_onemQ)) +
+  geom_abline(slope = 1) +
+  facet_wrap(~ culture_id, ncol = 5) +
+  scale_shape_manual(values = c(21, 22, 23, 21, 22, 23, 21, 21, 21, 22)) +
+  theme(aspect.ratio = 1, legend.position = "right") +
+  guides(shape = guide_legend(override.aes = list(fill = pal))) +
+  guides(fill = FALSE) +
+  xlab("[1 - Q] Non-photochemical quenching") +
+  ylab("[1 - C] Photochemical quenching")
+
+Fig1d <- data_ss %>%
+  filter(temperature == 27) %>%
+  filter(PAR == 0.1) %>%
+  group_by(sample_filename, culture_id, genus, PAR) %>%
+  summarise(mean_sigma = mean(Sig),
+            mean_FqFm = mean(FqFm)) %>%
+  mutate(sigLHCII = mean_sigma/mean_FqFm) %>%
+  mutate(culture_id = as.factor(culture_id)) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  ggplot(aes(culture_id, sigLHCII, fill = genus, shape = culture_id, group = culture_id)) +
+  geom_boxplot(aes(fill = culture_id)) +
+  theme(aspect.ratio = 1, legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = pal)
+
+Fig1e <- data_ss %>%
+  filter(temperature == 27) %>%
+  filter(PAR == 0.1) %>%
+  group_by(sample_filename, culture_id, genus, PAR) %>%
+  summarise(mean_Tau1 = mean(Tau1QA)) %>%
+  mutate(culture_id = as.factor(culture_id)) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  ggplot(aes(culture_id, mean_Tau1, fill = genus, shape = culture_id, group = culture_id)) +
+  geom_boxplot(aes(fill = culture_id)) +
+  theme(aspect.ratio = 1, legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = pal)
+
+Fig1f <- data_ss %>%
+  filter(temperature == 27) %>%
+  filter(sample_id != "CladeB_38") %>%
+  filter(PAR == 0.1) %>%
+  group_by(sample_filename, culture_id, genus, PAR) %>%
+  summarise(mean_Tau2 = mean(Tau2QA)) %>%
+  mutate(culture_id = as.factor(culture_id)) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  ggplot(aes(culture_id, mean_Tau2, fill = genus, shape = culture_id, group = culture_id)) +
+  geom_boxplot(aes(fill = culture_id)) +
+  theme(aspect.ratio = 1, legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = pal)
+
+Fig1g <- data_ss %>%
+  filter(temperature == 27) %>%
+  filter(PAR == 0.1) %>%
+  group_by(sample_filename, culture_id, genus, PAR) %>%
+  summarise(mean_Tau2 = mean(Tau2QA),
+            mean_PQP_Size = mean(PQP_Size)) %>%
+  mutate(Tau2_PQox = mean_Tau2/mean_PQP_Size) %>%
+  mutate(culture_id = as.factor(culture_id)) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  ggplot(aes(culture_id, Tau2_PQox, fill = genus, shape = culture_id, group = culture_id)) +
+  geom_boxplot(aes(fill = culture_id)) +
+  theme(aspect.ratio = 1, legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = pal)
+
+Fig1a + Fig1b + Fig1c + Fig1d + Fig1e + Fig1f + Fig1g
+```
+
+# Trait stats
+## Growth Rate
+
+```{r}
+# Growth rate and cell volume stats
+
+# apply bestNormalize heuristics
+gcv_data_bn <- elementome_mmolEtoP %>%
+  filter(temperature == 27) %>%
+  select(culture_id, sample_id, growth_rate)
+
+gcv_transformations <- data.frame()
+for(i in 3:ncol(gcv_data_bn)){
+  set.seed(12345)
+  dat <- gcv_data_bn %>% pull(i)
+  whichnorm <- bestNormalize(dat, standardize = FALSE)
+  print(colnames(gcv_data_bn[i]))
+  print(whichnorm)
+  gcv_data_bn[i] <- whichnorm$x.t
+  
+  trans <- data.frame(variable = colnames(gcv_data_bn[i]), transformation = class(whichnorm$chosen_transform))
+  gcv_transformations <- rbind(gcv_transformations, trans)
+}
+
+# Growth rate stats -------------------SIGNIFICANT---------------------------
+growth_rate_sumstats <- elementome_mmolEtoP_log %>%
+  group_by(culture_id) %>%
+  get_summary_stats(growth_rate, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(growth_rate ~ culture_id, data = gcv_data_bn)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS GOOD
+shapiro_test(residuals(model)) # LOOKS GOOD
+# Homogneity of variance assumption
+gcv_data_bn %>% levene_test(growth_rate ~ culture_id) # P value is not significant so we can assume equal variance. Proceed to anova.
+# AOV
+res_aov_growth_rate <- gcv_data_bn %>% anova_test(growth_rate ~ culture_id) # SIGNIFICANT
+growth_rate_pwc <- gcv_data_bn %>% tukey_hsd(growth_rate ~ culture_id) # A FEW INTERESTING DIFFERENCES
+```
+
+## Cell volume
+
+```{r}
+# apply bestNormalize heuristics
+vol_data_bn <- cell_volume_data %>%
+  filter(temperature == 27) %>%
+  select(culture_id, sample_id, VolumeEqSphere_um3)
+
+vol_transformations <- data.frame()
+for(i in 3:ncol(vol_data_bn)){
+  set.seed(12345)
+  dat <- vol_data_bn %>% pull(i)
+  whichnorm <- bestNormalize(dat, standardize = FALSE)
+  print(colnames(vol_data_bn[i]))
+  print(whichnorm)
+  vol_data_bn[i] <- whichnorm$x.t
+  
+  trans <- data.frame(variable = colnames(vol_data_bn[i]), transformation = class(whichnorm$chosen_transform))
+  vol_transformations <- rbind(vol_transformations, trans)
+}
+
+# Growth rate stats -------------------SIGNIFICANT---------------------------
+cell_vol_sumstats <- cell_volume_raw %>%
+  group_by(culture_id) %>%
+  get_summary_stats(VolumeEqSphere_um3, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(VolumeEqSphere_um3 ~ culture_id, data = vol_data_bn)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS GOOD
+shapiro_test(residuals(model)) # LOOKS GOOD
+# Homogneity of variance assumption
+vol_data_bn %>% levene_test(VolumeEqSphere_um3 ~ culture_id) # P value is not significant so we can assume equal variance. Proceed to anova.
+# AOV
+res_aov_cell_vol <- vol_data_bn %>% anova_test(VolumeEqSphere_um3 ~ culture_id) # SIGNIFICANT
+cell_vol_pwc <- vol_data_bn %>% tukey_hsd(VolumeEqSphere_um3 ~ culture_id)
+```
+
+## Quenching
+
+```{r}
+# Quenching parameters
+Q_data <- data_means %>%
+  filter(temperature == 27) %>%
+  filter(PAR == 750) %>%
+  mutate(C_Q_ratio = onemC/onemQ) %>%
+  select(culture_id, sample_id, onemC, onemQ, C_Q_ratio)
+
+# apply bestNormalize heuristics
+Q_data_bn <- Q_data
+
+Q_transformations <- data.frame()
+for(i in 3:ncol(Q_data_bn)){
+  set.seed(12345)
+  dat <- Q_data_bn %>% pull(i)
+  whichnorm <- bestNormalize(dat, standardize = FALSE)
+  print(colnames(Q_data_bn[i]))
+  print(whichnorm)
+  Q_data_bn[i] <- whichnorm$x.t
+  
+  trans <- data.frame(variable = colnames(Q_data_bn[i]), transformation = class(whichnorm$chosen_transform))
+  Q_transformations <- rbind(Q_transformations, trans)
+}
+
+# 1-C:1-Q at 750 stats ---------------------SIGNIFICANT--------------------------
+
+C_Q_ratio_sum_stats <- Q_data %>%
+  group_by(culture_id) %>%
+  get_summary_stats(C_Q_ratio, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(C_Q_ratio ~ culture_id, data = Q_data_bn)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS SKEWED so TRY LOG - LOOKS BETTER BUT STILL TAILS
+shapiro_test(residuals(model)) # The pvalue is still significant after log transformed. Proceed to Kruskal
+# Homogneity of variance assumption
+Q_data_bn %>% levene_test(C_Q_ratio ~ culture_id) # P value is not significant so we can assume equal variance
+# AOV
+res_aov_C_Q_ratio <- Q_data_bn %>% kruskal_test(C_Q_ratio ~ culture_id) # SIGNIFICANT
+C_Q_ratio_pwc <- Q_data_bn %>% dunn_test(C_Q_ratio ~ culture_id) # NO DIFFERENCES....
+
+# [1-C] ----------------------SIGNIFICANT--------------
+
+onemC_sum_stats <- Q_data %>%
+  group_by(culture_id) %>%
+  get_summary_stats(onemC, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(onemC ~ culture_id, data = Q_data_bn)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS OK
+shapiro_test(residuals(model)) # The pvalue is still significant. Proceed to Kruskal
+# Homogneity of variance assumption
+Q_data_bn %>% levene_test(onemC ~ culture_id) # P value is not significant so we can assume equal variance
+# AOV
+res_aov_onemC <- Q_data_bn %>% kruskal_test(onemC ~ culture_id) # SIGNIFICANT
+onemC_pwc <- Q_data_bn %>% dunn_test(onemC ~ culture_id) # NO DIFFERENCES
+
+# [1-Q] ----------------------SIGNIFICANT--------------
+
+onemQ_sum_stats <- Q_data %>%
+  group_by(culture_id) %>%
+  get_summary_stats(onemQ, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(onemQ ~ culture_id, data = Q_data_bn)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS OK
+shapiro_test(residuals(model)) # LOOKS OK
+# Homogneity of variance assumption
+Q_data_bn %>% levene_test(onemQ ~ culture_id) # P value is not significant so we can assume equal variance
+# AOV
+res_aov_onemQ <- Q_data_bn %>% anova_test(onemQ ~ culture_id) # SIGNIFICANT
+onemQ_pwc <- Q_data_bn %>% tukey_hsd(onemQ ~ culture_id) # LOTS OF SIGNIFICANT DIFFERENCES
+```
+
+## Instantaneous photobiology
+
+```{r}
+inst_params_stats <- data_ss %>%
+  filter(PAR == 0.1) %>%
+  select(sample_filename, sample_id, culture_id:curve_id, Fo, FqFm, Sig, PQP_Size, Tau1QA, Tau2QA) %>%
+  group_by(sample_filename, sample_id, culture_id, date, temperature, genus, ITS2_type, keep, temp_comparison, PAR_factor, curve_id) %>%
+  mutate(sigLHCII = Sig/FqFm,
+         t2_PQox = Tau2QA/PQP_Size) %>%
+  summarise(ss_FqFm = mean(FqFm),
+            ss_Sig = mean(Sig),
+            ss_PQP_Size = mean(PQP_Size),
+            ss_Tau1QA = mean(Tau1QA),
+            ss_Tau2QA = mean(Tau2QA),
+            ss_sigLHCII = mean(sigLHCII),
+            ss_t2_PQox = mean(t2_PQox)) %>%
+    filter(temperature == 27) %>%
+    pivot_wider(id_cols = sample_filename:curve_id, names_from = PAR_factor, values_from = ss_FqFm:ss_t2_PQox) %>%
+  ungroup() %>%
+  select(culture_id, sample_id, ss_FqFm_0.1:ss_t2_PQox_0.1)
+
+# apply bestNormalize heuristics
+inst_params_stats_bn <- inst_params_stats
+
+inst_transformations <- data.frame()
+for(i in 3:ncol(inst_params_stats_bn)){
+  set.seed(3455)
+  dat <- inst_params_stats_bn %>% pull(i)
+  whichnorm <- bestNormalize(dat, standardize = FALSE)
+  print(colnames(inst_params_stats_bn[i]))
+  print(whichnorm)
+  inst_params_stats_bn[i] <- whichnorm$x.t
+  
+  trans <- data.frame(variable = colnames(inst_params_stats_bn[i]), transformation = class(whichnorm$chosen_transform))
+  inst_transformations <- rbind(inst_transformations, trans)
+}
+
+# ss_sigLHCII_0.1 -------------------SIGNIFICANT---------------------------
+sigLHCII_0.1_sumstats <- inst_params_stats %>%
+  group_by(culture_id) %>%
+  get_summary_stats(ss_sigLHCII_0.1, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(ss_sigLHCII_0.1 ~ culture_id, data = inst_params_stats_bn)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS GOOD
+shapiro_test(residuals(model)) # LOOKS GOOD
+# Homogneity of variance assumption
+inst_params_stats_bn %>% levene_test(ss_sigLHCII_0.1 ~ culture_id) # P value is not significant so we can assume equal variance. Proceed to anova.
+# AOV
+res_aov_ss_sigLHCII_0.1 <- inst_params_stats_bn %>% anova_test(ss_sigLHCII_0.1 ~ culture_id) # SIGNIFICANT
+sigLHCII_pwc <- inst_params_stats_bn %>% tukey_hsd(ss_sigLHCII_0.1 ~ culture_id) # LOTS OF INTERESTING DIFFERENCES
+
+# TAU1QA_0.1 -------------------SIGNIFICANT---------------------------
+Tau1QA_0.1_sumstats <- inst_params_stats %>%
+  group_by(culture_id) %>%
+  get_summary_stats(ss_Tau1QA_0.1, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(ss_Tau1QA_0.1 ~ culture_id, data = inst_params_stats_bn)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS OK
+shapiro_test(residuals(model)) # LOOKS OK
+# Homogneity of variance assumption
+inst_params_stats_bn %>% levene_test(ss_Tau1QA_0.1 ~ culture_id) # P value is not significant so we can assume equal variance. 
+# AOV
+res_aov_ss_Tau1QA_0.1 <- inst_params_stats_bn %>% anova_test(ss_Tau1QA_0.1 ~ culture_id) # SIGNIFICANT
+Tau1QA_0.1_pwc <- inst_params_stats_bn %>% tukey_hsd(ss_Tau1QA_0.1 ~ culture_id) # INTERESTING DIFFERENCES
+
+# TAU2QA_0.1 -------------------NOT SIGNIFICANT---------------------------
+Tau2QA_0.1_sumstats <- inst_params_stats %>%
+  group_by(culture_id) %>%
+  get_summary_stats(ss_Tau2QA_0.1, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(ss_Tau2QA_0.1 ~ culture_id, data = inst_params_stats_bn)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS OK
+shapiro_test(residuals(model)) # LOOKS OK
+# Homogneity of variance assumption
+inst_params_stats_bn %>% levene_test(ss_Tau2QA_0.1 ~ culture_id) # P value is not significant so we can assume equal variance
+# AOV
+res_aov_ss_Tau2QA_0.1 <- inst_params_stats_bn %>% anova_test(ss_Tau2QA_0.1 ~ culture_id) # NOT SIGNIFICANT
+Tau2QA_0.1_pwc <- inst_params_stats_bn %>% tukey_hsd(ss_Tau2QA_0.1 ~ culture_id) # NO DIFFERENCES
+
+# t2_PQox_0.1 -------------------SIGNIFICANT---------------------------
+t2_PQox_0.1_sumstats <- inst_params_stats %>%
+  group_by(culture_id) %>%
+  get_summary_stats(ss_t2_PQox_0.1, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(ss_t2_PQox_0.1 ~ culture_id, data = inst_params_stats_bn)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS GOOD
+shapiro_test(residuals(model)) # LOOKS OK
+# Homogneity of variance assumption
+inst_params_stats_bn %>% levene_test(ss_t2_PQox_0.1 ~ culture_id) # P value is not significant so we can assume equal variance
+# AOV
+res_aov_ss_t2_PQox_0.1 <- inst_params_stats_bn %>% anova_test(ss_t2_PQox_0.1 ~ culture_id) # SIGNIFICANT
+t2_PQox_0.1_pwc <- inst_params_stats_bn %>% tukey_hsd(ss_t2_PQox_0.1 ~ culture_id) # LOTS OF INTERESTING DIFFERENCES
+```
+
+## Write stats outputs
+
+```{r}
+# Write_csvs summary stats
+# write_csv(rbind(growth_rate_sumstats, cell_vol_sumstats, sigLHCII_0.1_sumstats, Tau1QA_0.1_sumstats, Tau2QA_0.1_sumstats, t2_PQox_0.1_sumstats, C_Q_ratio_sum_stats, onemC_sum_stats, onemQ_sum_stats), "traits_summary_statistics.csv")
+
+# Write pairwise comparisons
+# write_csv(growth_rate_pwc, "pairwise_tukey_growth_rate.csv")
+# write_csv(cell_vol_pwc, "pairwise_tukey_cell_volume.csv")
+# write_csv(sigLHCII_pwc, "pairwise_tukey_sigmaLHCII.csv")
+# write_csv(Tau1QA_0.1_pwc, "pairwise_tukey_Tau1.csv")
+# write_csv(Tau2QA_0.1_pwc, "pairwise_tukey_Tau2.csv")
+# write_csv(t2_PQox_0.1_pwc, "pairwise_tukey_Tau2_PQox.csv")
+# write_csv(C_Q_ratio_pwc, "pairwise_dunns_C_Q_ratio.csv")
+# write_csv(onemC_pwc, "pairwise_dunns_onemC.csv")
+# write_csv(onemQ_pwc, "pairwise_tukey_onemQ.csv")
+
+# Write_csv AOV results
+# res_aov_growth_rate %>%
+#   gt() %>%
+#   tab_header(title = "ANOVA Growth Rate")
+# 
+# res_aov_cell_vol %>%
+#   gt() %>%
+#   tab_header(title = "Anova Cell Volume")
+# 
+# res_aov_ss_sigLHCII_0.1 %>%
+#   gt() %>%
+#   tab_header(title = "ANOVA SigmaLHCII")
+# 
+# res_aov_ss_Tau1QA_0.1 %>%
+#   gt() %>%
+#   tab_header(title = "ANOVA Tau1")
+# 
+# res_aov_ss_Tau2QA_0.1 %>%
+#   gt() %>%
+#   tab_header(title = "ANOVA Tau2")
+# 
+# res_aov_ss_t2_PQox_0.1 %>%
+#   gt() %>%
+#   tab_header(title = "ANOVA Tau2_PQox")
+# 
+# res_aov_C_Q_ratio %>%
+#   gt() %>%
+#   tab_header(title = "Kruskal Wallis C_Q_ratio")
+# 
+# res_aov_onemC %>%
+#   gt() %>%
+#   tab_header(title = "Kruskal Wallis 1-C")
+# 
+# res_aov_onemQ %>%
+#   gt() %>%
+#   tab_header(title = "ANOVA 1-Q")
+
+# Write_csv_transformations
+# rbind(gcv_transformations, vol_transformations, inst_transformations, Q_transformations) %>%
+#   filter(transformation != "list") %>%
+#   write_csv(., "trait_transformation_list.csv")
+```
+
+### Check correlation of cell volume and cell growth rates with elementome
+
+```{r}
+elementome_abs_long <- elementome_abs %>%
+  left_join(., vol_data_bn) %>%
+  pivot_longer(P31:Mo96, names_to = "elements", values_to = "quota") %>%
+  filter(temperature == 27)
+
+# Cell volume
+cv_lm <- elementome_abs_long %>% 
+  group_by(elements) %>%
+  do(model = lm(VolumeEqSphere_um3 ~ quota, data = .))
+
+cv_tidy <- cv_lm %>% 
+  ungroup() %>%
+  mutate(tidy = map(model, tidy)) %>% 
+  unnest(tidy)
+cv_glance <- cv_lm %>%   
+  ungroup() %>%
+  mutate(glance = map(model, glance)) %>% 
+  unnest(glance)
+
+#write.csv(cv_glance %>% select(-model), "cellVolume_linear_elementome_absolute.csv")
+
+# Growth rate
+gr_lm <- elementome_abs_long %>% 
+  group_by(elements) %>% 
+  do(model = lm(growth_rate ~ quota, data = .))
+
+gr_tidy <- gr_lm %>%  
+  ungroup() %>%
+  mutate(tidy = map(model, tidy)) %>% 
+  unnest(tidy)
+gr_glance <- gr_lm %>%
+  ungroup() %>%
+  mutate(glance = map(model, glance)) %>% 
+  unnest(glance)
+
+#write.csv(gr_glance %>% select(-model), "growthRate_linear_elementome_absolute.csv")
+
+# Mo96 is positively correlated with growth rate (p < 0.05).
+
+mo <- elementome_abs_long %>%
+  filter(elements == "Mo96") %>%
+  ggplot(aes(x = growth_rate, y = quota)) +
+  geom_point(aes(fill = culture_id), shape = 21, size = 5) +
+  geom_smooth(method = "lm")  +
+  stat_cor(label.x = 0.17, label.y = 0.0004) +
+  stat_regline_equation(label.x = 0.17) +
+  ylab("Mo96 Quota") +
+  theme(aspect.ratio = 1)
+
+mo
+```
+
+# repeat with means - carbon with and without SCF outlier.
+
+```{r}
+elementome_abs_long <- elementome_abs %>%
+  left_join(., vol_data_bn) %>%
+  pivot_longer(P31:Mo96, names_to = "elements", values_to = "quota") %>%
+  group_by(culture_id, elements, temperature) %>%
+  summarise(VolumeEqSphere_um3 = mean(VolumeEqSphere_um3),
+            quota = mean(quota),
+            growth_rate = mean(growth_rate)) %>%
+  filter(temperature == 27) %>%
+  ungroup()
+
+# Cell volume
+cv_lm <- elementome_abs_long %>% 
+  group_by(elements) %>%
+  do(model = lm(VolumeEqSphere_um3 ~ quota, data = .))
+
+cv_tidy <- cv_lm %>% 
+  ungroup() %>%
+  mutate(tidy = map(model, tidy)) %>% 
+  unnest(tidy)
+cv_glance <- cv_lm %>%   
+  ungroup() %>%
+  mutate(glance = map(model, glance)) %>% 
+  unnest(glance)
+
+write.csv(cv_glance %>% select(-model), "cellVolume_linear_elementome_absolute_means.csv")
+
+# Growth rate
+gr_lm <- elementome_abs_long %>% 
+  group_by(elements) %>% 
+  do(model = lm(growth_rate ~ quota, data = .))
+
+gr_tidy <- gr_lm %>%  
+  ungroup() %>%
+  mutate(tidy = map(model, tidy)) %>% 
+  unnest(tidy)
+gr_glance <- gr_lm %>%
+  ungroup() %>%
+  mutate(glance = map(model, glance)) %>% 
+  unnest(glance)
+
+write.csv(gr_glance %>% select(-model), "growthRate_linear_elementome_absolute_means.csv")
+
+# Mo96 is positively correlated with growth rate (p < 0.05).
+
+mo <- elementome_abs_long %>%
+  filter(elements == "C",
+         culture_id != "SCF05506"
+         ) %>%
+  ggplot(aes(x = VolumeEqSphere_um3, y = quota)) +
+  geom_point(aes(fill = culture_id), shape = 21, size = 5) +
+  geom_smooth(method = "lm")  +
+  stat_cor(label.x = 0.17, label.y = 0.0004) +
+  stat_regline_equation(label.x = 0.17) +
+  ylab("Mo96 Quota") +
+  theme(aspect.ratio = 1)
+
+mo
+
+N <- elementome_abs_long %>%
+  filter(elements == "C",
+         culture_id != "UTSD") %>%
+  ggplot(aes(x = growth_rate, y = quota)) +
+  geom_point(aes(fill = culture_id), shape = 21, size = 5) +
+  geom_smooth(method = "lm")  +
+  stat_cor(label.x = 0.17, label.y = 0.0004) +
+  stat_regline_equation(label.x = 0.17) +
+  ylab("N Quota") +
+  theme(aspect.ratio = 1)
+
+N
+```
+
+
+# Elementome min-max
+
+```{r}
+# Modify the rstatix get_summary stats function to return more decimal places
+get_summary_stats_all <- function (data, ..., type = c("full", "common", "robust", 
+    "five_number", "mean_sd", "mean_se", "mean_ci", 
+    "median_iqr", "median_mad", "quantile", 
+    "mean", "median", "min", "max"), 
+    show = NULL, probs = seq(0, 1, 0.25)) 
+{
+    type = match.arg(type)
+    if (is_grouped_df(data)) {
+        results <- data %>% doo(get_summary_stats_all, ..., type = type, 
+            show = show)
+        return(results)
+    }
+    data <- data %>% rstatix:::select_numeric_columns()
+    vars <- data %>% rstatix:::get_selected_vars(...)
+    n.vars <- length(vars)
+    if (n.vars >= 1) {
+        data <- data %>% select(!!!syms(vars))
+    }
+    variable <- .value. <- NULL
+    data <- data %>% gather(key = "variable", value = ".value.") %>% 
+        filter(!is.na(.value.)) %>% group_by(variable)
+    results <- switch(type, common = common_summary(data), robust = robust_summary(data), 
+        five_number = five_number_summary(data), mean_sd = mean_sd(data), 
+        mean_se = mean_se(data), mean_ci = mean_ci(data), median_iqr = median_iqr(data), 
+        median_mad = median_mad(data), quantile = quantile_summary(data, 
+            probs), mean = mean_(data), median = median_(data), 
+        min = min_(data), max = max_(data), rstatix:::full_summary(data)) %>% 
+        dplyr::mutate_if(is.numeric, round, digits = 7)
+    if (!is.null(show)) {
+        show <- unique(c("variable", "n", show))
+        results <- results %>% select(!!!syms(show))
+    }
+    results
+}
+
+
+# All trace
+elementome_mmolEtoP_log <- elementome_mmolEtoP %>%
+  filter(C > 0) %>%
+  mutate(across(P31:Mo96, ~na_if(., 0))) %>%
+  mutate(across(P31:Mo96, log)) %>%
+  group_by(culture_id) %>%
+  mutate(culture_rep = row_number(),
+    id = paste0(culture_id, "_", culture_rep))
+
+min_max_trace_df <- elementome_mmolEtoP_log %>%
+  select(V51:Mo96) %>%
+  pivot_longer(V51:Mo96, names_to = "elements", values_to = "quota") %>%
+  group_by(elements) %>%
+  select(elements, quota) %>%
+  get_summary_stats_all(type = "full") %>%
+  mutate(range = min * max)
+
+#write_csv(min_max_trace_df, "min_max_trace.csv")
+
+min_max_trace <- ggplot(min_max_trace_df, aes(range, median)) +
+  geom_point() +
+  geom_text_repel(aes(label = elements)) +
+  geom_smooth(method = "lm")  +
+  stat_cor(label.x = 75, label.y = -1) +
+  theme(aspect.ratio = 1)
+
+# All elements 
+
+elementome_mmolEtoP_log <- elementome_mmolEtoP %>%
+  filter(C > 0) %>%
+  mutate(across(N:Mo96, ~na_if(., 0))) %>%
+  mutate(across(N:Mo96, log)) %>%
+  group_by(culture_id) %>%
+  mutate(culture_rep = row_number(),
+    id = paste0(culture_id, "_", culture_rep))
+
+min_max_all_df <- elementome_mmolEtoP_log %>%
+  select(N:Mo96) %>%
+  pivot_longer(N:Mo96, names_to = "elements", values_to = "quota") %>%
+  group_by(elements) %>%
+  select(elements, quota) %>%
+  get_summary_stats_all(type = "full") %>%
+  mutate(range = min * max)
+
+#write_csv(min_max_all_df, "min_max_all.csv")
+
+min_max_all <- ggplot(min_max_all_df, aes(range, median)) +
+  geom_point() +
+  geom_text_repel(aes(label = elements)) +
+  geom_smooth(method = "lm")  +
+  stat_cor(label.x = 65, label.y = 5) +
+   theme(aspect.ratio = 1)
+
+# N to growth rate
+elementome_mmolEtoP_log %>%
+  filter(temperature == 27) %>%
+  ggplot(aes(N, growth_rate)) +
+  geom_point() +
+  #geom_text_repel(aes(label = culture_id)) +
+  geom_smooth(method = "lm")  +
+  stat_cor() +
+  theme(aspect.ratio = 1)
+```
+
+# Elementome PCA
+
+## Figure 2 - CNP and elementome PCA
+
+```{r}
+Fig2a <- elementome_mmolEtoP %>%
+  filter(temperature == 27) %>%
+  filter(N > 0) %>%
+  select(culture_id, genus, C, N, P31) %>%
+  group_by(genus, culture_id) %>%
+  summarise(mean_C = mean(C),
+            sd_C = sd(C),
+            mean_N = mean(N),
+            sd_N = sd(N),
+            mean_P = mean(P31),
+            sd_P = sd(P31)) %>%
+  ungroup() %>%
+  pivot_longer(names_to = "elements", cols = contains("mean")) %>%
+  mutate(culture_id = factor(culture_id),
+         genus = factor(genus)) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  ggplot(aes(culture_id, value)) +
+  geom_bar(aes(fill = genus), stat = 'identity', position = "stack") +
+  geom_bar(stat="identity", fill="black", aes(alpha = fct_rev(elements))) +
+  scale_alpha_manual(values = c(0.4, 0.25, 0.05)) +
+  theme(aspect.ratio = 1) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), legend.position = "left") +
+  ylab("C:N:P (Mean)") +
+  xlab("Symbiodiniaceae culture")
+```
+
+# PCA
+
+```{r}
+elementome_mmolEtoP_log <- elementome_mmolEtoP %>%
+  filter(temperature == 27) %>%
+  filter(C > 0) %>%
+  mutate(across(P31:Mo96, ~na_if(., 0))) %>%
+  mutate(across(P31:Mo96, ~replace_na(., 0.000000001))) %>%
+  mutate(across(P31:Mo96, log))
+
+elementome_rda <- elementome_mmolEtoP_log %>%
+  column_to_rownames(var = "sample_id") %>%
+  select(N:Mo96)
+
+# zero mean
+elementome_rda <- decostand(elementome_rda, method = "standardize")
+
+# pca
+pca <- rda(elementome_rda)
+eig <- eigenvals(pca)
+eig <- data.frame(summary(eig))
+
+# extract the scores
+scrs_samples <- as.data.frame(scores(pca, display = "sites")) %>% # Extract scores
+  rownames_to_column(var = "sample_id")
+scrs_elements <- as.data.frame(scores(pca, display = "species")) %>% # Extract scores
+  rownames_to_column(var = "Elements")
+
+set.seed(8645)
+k_ele <- kmeans(elementome_rda, 2)
+k_df <- enframe(k_ele$cluster) %>%
+  select(sample_id = name, k = value)
+
+# create plot dataframe
+plot_df <- left_join(elementome_mmolEtoP_log, scrs_samples) %>%
+  left_join(., k_df) %>%
+  mutate(culture_id = as.factor(culture_id)) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61"))
+
+## Create ggplot figure
+Fig2b <- ggplot(plot_df, aes(x = -PC1, y = PC2)) +
+  geom_point(aes(fill = genus, shape = culture_id), size = 4) +
+  #geom_encircle(aes(group = culture_id, fill = genus), s_shape = 1, expand = 0, alpha = 0.2, show.legend = FALSE) +
+  geom_encircle(aes(group = k), fill = "grey50", s_shape = 1, expand = 0, alpha = 0.2, show.legend = FALSE) +
+  geom_text(data = scrs_elements, aes(x = -PC1, y = PC2, label = Elements), size = 4) +
+  geom_segment(data = scrs_elements, aes(x = 0, xend = -PC1, y = 0, yend = PC2), size = 0.5, arrow = arrow(length = unit(0.25, "cm")), colour = "grey") +
+  scale_shape_manual(values = c(21, 22, 23, 21, 22, 23, 21, 21, 21, 22)) +
+  guides(shape = guide_legend(override.aes = list(fill = pal))) +
+  guides(colour = FALSE, fill = FALSE) +
+  theme(legend.position = "right", aspect.ratio = 1)
+
+Fig2b
+```
+
+## PCA Outputs
+
+```{r}
+# write_csv(eig %>% rownames_to_column(var = "summary"), "eigenvals_cumulative_proportion_PCA.csv")
+# write_csv(scrs_elements %>%  mutate(PC1 = abs(PC1), PC2 = abs(PC2)) %>% arrange(desc(PC1)), "element_loadings_in_PCA.csv")
+```
+
+## Fig 2
+
+```{r}
+Fig2a + Fig2b
+```
+
+## PCA loadings stats
+
+```{r}
+#PC1
+PC1_stats <- plot_df %>%
+  select(culture_id, PC1)
+
+PC1_sumstats <- PC1_stats %>%
+  group_by(culture_id) %>%
+  get_summary_stats(PC1, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(PC1 ~ culture_id, data = PC1_stats)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS OK
+shapiro_test(residuals(model)) # LOOKS OK
+# Homogneity of variance assumption
+PC1_stats %>% levene_test(PC1 ~ culture_id)
+# AOV
+PC1_aov <- PC1_stats %>% anova_test(PC1 ~ culture_id)
+PC1_pwc <- PC1_stats %>% tukey_hsd(PC1 ~ culture_id)
+
+#PC2
+PC2_stats <- plot_df %>%
+  select(culture_id, PC2)
+
+PC2_sumstats <- PC2_stats %>%
+  group_by(culture_id) %>%
+  get_summary_stats(PC2, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(PC2 ~ culture_id, data = PC2_stats)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS OK
+shapiro_test(residuals(model)) # LOOKS OK
+# Homogneity of variance assumption
+PC2_stats %>% levene_test(PC2 ~ culture_id)
+# AOV
+PC2_aov <- PC2_stats %>% anova_test(PC2 ~ culture_id)
+PC2_pwc <- PC2_stats %>% tukey_hsd(PC2 ~ culture_id)
+
+# write_csv(PC1_aov, "PC1_anova.csv")
+# write_csv(PC2_aov, "PC2_anova.csv")
+# 
+# write_csv(PC1_pwc, "PC1_tukey_pair_wise.csv")
+# write_csv(PC2_pwc, "PC2_tukey_pair_wise.csv")
+```
+
+## Redundancy analysis
+
+```{r}
+traits_elements <- elementome_mmolEtoP %>%
+  filter(temperature == 27) %>%
+  select(sample_id, culture_id, genus, History, Host) %>%
+  left_join(., gcv_data_bn) %>%
+  left_join(., vol_data_bn) %>%
+  left_join(., inst_params_stats_bn) %>%
+  left_join(., Q_data_bn) %>%
+  filter(sample_id != "SCF05506_08112019")
+
+traits_elements <- left_join(traits_elements, elementome_rda %>% rownames_to_column(var = "sample_id"))
+
+# check name orders
+traits_elements$sample_id == rownames(elementome_rda)
+
+rda_res <- rda(elementome_rda ~ ss_sigLHCII_0.1 + ss_Tau1QA_0.1 + ss_Tau2QA_0.1 + ss_t2_PQox_0.1 + onemC + onemQ + growth_rate + VolumeEqSphere_um3, data = traits_elements)
+
+adjR <- RsquareAdj(rda_res)$adj.r.squared
+
+enframe(vif.cca(rda_res)) # caution advised with multilinearity for some variables
+
+permutest(rda_res, by = 'terms', permutations = 9999)
+```
+
+# Fig Supp boxplots
+
+```{r}
+x1000 <- function(x){x <- x*1000}
+
+supp_abs <- elementome_abs %>%
+  filter(temperature == 27) %>%
+  filter(C > 0) %>%
+  select(genus, culture_id, P31:Mo96) %>%
+  mutate(across(V51:Mo96, x1000)) %>%
+  pivot_longer(names_to = "elements", cols = P31:Mo96) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  mutate(elements = fct_inorder(elements)) %>%
+  ggplot(aes(culture_id, value)) +
+  geom_boxplot(aes(fill = culture_id)) +
+  facet_wrap(~elements, scales = "free_y", ncol = 6) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), legend.position = "top") +
+  scale_fill_manual(values = pal) +
+  theme(aspect.ratio = 1) +
+  ylab("Absolute") +
+  xlab("Symbiodiniaceae culture")
+
+supp_abs_cell <- elementome_abs_cell %>%
+  filter(temperature == 27) %>%
+  filter(C > 0) %>%
+  select(genus, culture_id, P31:Mo96) %>%
+  mutate(across(V51:Mo96, x1000)) %>%
+  pivot_longer(names_to = "elements", cols = P31:Mo96) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  mutate(elements = fct_inorder(elements)) %>%
+  ggplot(aes(culture_id, value)) +
+  geom_boxplot(aes(fill = culture_id)) +
+  facet_wrap(~elements, scales = "free_y", ncol = 6) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), legend.position = "top") +
+  scale_fill_manual(values = pal) +
+  theme(aspect.ratio = 1) +
+  ylab("Absolute Cell") +
+  xlab("Symbiodiniaceae culture")
+
+supp_e_to_p <- elementome_mmolEtoP %>%
+  filter(temperature == 27) %>%
+  filter(C > 0) %>%
+  select(genus, culture_id, N:Mo96) %>%
+  mutate(across(V51:Mo96, x1000)) %>%
+  pivot_longer(names_to = "elements", cols = N:Mo96) %>%
+  mutate(culture_id = fct_relevel(culture_id, "CladeB", "PVB18B", "RT12", "HeteroM", "SCF05506", "SCF05804", "UTSD", "CCMP3420", "CCMP2548", "RT61")) %>%
+  mutate(elements = fct_inorder(elements)) %>%
+  ggplot(aes(culture_id, value)) +
+  geom_boxplot(aes(fill = culture_id)) +
+  facet_wrap(~elements, scales = "free_y", ncol = 6) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), legend.position = "top") +
+  scale_fill_manual(values = pal) +
+  theme(aspect.ratio = 1) +
+  ylab("E to P") +
+  xlab("Symbiodiniaceae culture")
+```
+
+# All EP stats
+
+```{r}
+all_EP_stats <- elementome_mmolEtoP_log %>%
+  pivot_longer(names_to = "elements", cols = N:Mo96, values_to = "quota") %>%
+  group_by(elements) %>%
+  anova_test(quota ~ culture_id) %>%
+  adjust_pvalue()
+
+all_EP_tukey <- elementome_mmolEtoP_log %>%
+  pivot_longer(names_to = "elements", cols = N:Mo96, values_to = "quota") %>%
+  group_by(elements) %>%
+  tukey_hsd(quota ~ culture_id)
+
+write_csv(all_EP_stats, "all_EP_stats.csv")
+write_csv(all_EP_tukey, "all_EP_tukey.csv")
+```
+
+# -----------
+
+# Temperature
+
+## Trait stats
+
+### FvFm
+
+Look at all cultures
+
+```{r}
+data_means %>%
+  filter(temperature == 27) %>%
+  filter(PAR == 0.1) %>%
+  ggplot(aes(culture_id, FqFm)) +
+  geom_boxplot()
+```
+
+temp comparisons
+
+```{r}
+data_means %>%
+  filter(temp_comparison == "y") %>%
+  filter(culture_id != "SCF05804") %>%
+  filter(PAR == 0.1) %>%
+  ggplot(aes(culture_id, FqFm)) +
+  geom_boxplot(aes(fill = temperature)) +
+  facet_grid(~ culture_id, scales = "free_x") +
+  scale_fill_manual(values = c("grey80", "red")) +
+  theme(aspect.ratio = 1)
+```
+
+```{r}
+FqFm_data_bn <- data_means %>% 
+  filter(temp_comparison == "y") %>%
+  filter(culture_id != "SCF05804") %>%
+  filter(PAR == 0.1) %>%
+  select(sample_id, culture_id, temperature, FqFm)
+
+# apply bestNormalize heuristics
+
+FqFm_transformations <- data.frame()
+for(i in 4:ncol(FqFm_data_bn)){
+  set.seed(12345)
+  dat <- FqFm_data_bn %>% pull(i)
+  whichnorm <- bestNormalize(dat, standardize = FALSE)
+  print(colnames(FqFm_data_bn[i]))
+  print(whichnorm)
+  FqFm_data_bn[i] <- whichnorm$x.t
+  
+  trans <- data.frame(variable = colnames(FqFm_data_bn[i]), transformation = class(whichnorm$chosen_transform))
+  FqFm_transformations <- rbind(FqFm_transformations, trans)
+}
+
+# Sum stats
+FqFm_sumstats <- FqFm_data_bn %>%
+  group_by(culture_id, temperature) %>%
+  get_summary_stats(FqFm, type = "mean_sd")
+
+temp_res_aov_FqFm <- FqFm_data_bn %>%
+  group_by(culture_id) %>%
+  kruskal_test(FqFm ~ temperature)
+```
+
+### Growth rate
+
+```{r}
+# apply bestNormalize heuristics
+gcv_data_bn_temp <- elementome_mmolEtoP %>%
+  filter(temp_comparison == "y") %>%
+  filter(culture_id != "SCF05804") %>%
+  select(sample_id, culture_id, temperature, growth_rate)
+
+
+gcv_transformations_temp <- data.frame()
+for(i in 4:ncol(gcv_data_bn_temp)){
+  set.seed(12345)
+  dat <- gcv_data_bn_temp %>% pull(i)
+  whichnorm <- bestNormalize(dat, standardize = FALSE)
+  print(colnames(gcv_data_bn_temp[i]))
+  print(whichnorm)
+  gcv_data_bn_temp[i] <- whichnorm$x.t
+  
+  trans <- data.frame(variable = colnames(gcv_data_bn_temp[i]), transformation = class(whichnorm$chosen_transform))
+  gcv_transformations_temp <- rbind(gcv_transformations_temp, trans)
+}
+
+# Sum stats
+gr_sumstats_temp <- gcv_data_bn_temp %>%
+  group_by(culture_id, temperature) %>%
+  get_summary_stats(growth_rate, type = "mean_sd")
+
+temp_res_aov_gr <- gcv_data_bn_temp %>%
+  group_by(culture_id) %>%
+  kruskal_test(growth_rate ~ temperature)
+```
+
+### Cell volume
+
+```{r}
+vol_data_bn_temp <- cell_volume_data %>%
+  filter(culture_id == "UTSD" | culture_id == "CCMP3420" | culture_id == "RT61") %>%
+  select(sample_id, culture_id, temperature, VolumeEqSphere_um3)
+
+vol_transformations_temp <- data.frame()
+for(i in 4:ncol(vol_data_bn_temp)){
+  set.seed(12345)
+  dat <- vol_data_bn_temp %>% pull(i)
+  whichnorm <- bestNormalize(dat, standardize = FALSE)
+  print(colnames(vol_data_bn_temp[i]))
+  print(whichnorm)
+  vol_data_bn_temp[i] <- whichnorm$x.t
+  
+  trans <- data.frame(variable = colnames(vol_data_bn_temp[i]), transformation = class(whichnorm$chosen_transform))
+  vol_transformations_temp <- rbind(vol_transformations_temp, trans)
+}
+
+# Sum stats
+vol_sumstats_temp <- vol_data_bn_temp %>%
+  group_by(culture_id, temperature) %>%
+  get_summary_stats(VolumeEqSphere_um3, type = "mean_sd")
+
+temp_res_aov_vol <- vol_data_bn_temp %>%
+  group_by(culture_id) %>%
+  kruskal_test(VolumeEqSphere_um3 ~ temperature)
+```
+
+### Write Stats outputs
+
+```{r}
+# temp_res_aov_gr %>%
+#   gt() %>%
+#   tab_header(title = "Kruskal Temp Growth Rate")
+# 
+# temp_res_aov_vol %>%
+#   gt() %>%
+#   tab_header(title = "Kruskal Temp Cell Volume")
+# 
+# temp_res_aov_FqFm %>%
+#   gt() %>%
+#   tab_header(title = "Kruskal Temp Fv/Fm")
+# 
+# write_csv(rbind(vol_sumstats_temp, gr_sumstats_temp, FqFm_sumstats), "traits_temp_summary_statistics.csv")
+```
+
+
+### Quenching - not included at present
+
+```{r}
+# Q_data_bn_temp <- data_means %>% 
+#   filter(temp_comparison == "y") %>%
+#   filter(culture_id != "SCF05804") %>%
+#   filter(PAR == 150) %>%
+#   select(sample_id, culture_id, temperature, onemQ, onemC) %>%
+#   mutate(C_Q_ratio = onemC/onemQ)
+# 
+# # apply bestNormalize heuristics
+# 
+# Q_transformations_temp <- data.frame()
+# for(i in 4:ncol(Q_data_bn_temp)){
+#   set.seed(12345)
+#   dat <- Q_data_bn_temp %>% pull(i)
+#   whichnorm <- bestNormalize(dat, standardize = FALSE)
+#   print(colnames(Q_data_bn_temp[i]))
+#   print(whichnorm)
+#   Q_data_bn_temp[i] <- whichnorm$x.t
+#   
+#   trans <- data.frame(variable = colnames(Q_data_bn_temp[i]), transformation = class(whichnorm$chosen_transform))
+#   Q_transformations_temp <- rbind(Q_transformations_temp, trans)
+# }
+# 
+# #onemC
+# 
+# # Sum stats
+# onemC_sumstats_temp <- Q_data_bn_temp %>%
+#   group_by(culture_id, temperature) %>%
+#   get_summary_stats(onemC, type = "mean_sd")
+# 
+# temp_res_aov_onemC <- Q_data_bn_temp %>%
+#   group_by(culture_id) %>%
+#   kruskal_test(onemC ~ temperature)
+# 
+# #onemQ
+# 
+# # Sum stats
+# onemQ_sumstats_temp <- Q_data_bn_temp %>%
+#   group_by(culture_id, temperature) %>%
+#   get_summary_stats(onemQ, type = "mean_sd")
+# 
+# temp_res_aov_onemQ <- Q_data_bn_temp %>%
+#   group_by(culture_id) %>%
+#   kruskal_test(onemQ ~ temperature)
+# 
+# #C_Q_ratio
+# 
+# # Sum stats
+# C_Q_ratio_sumstats_temp <- Q_data_bn_temp %>%
+#   group_by(culture_id, temperature) %>%
+#   get_summary_stats(C_Q_ratio, type = "mean_sd")
+# 
+# temp_res_aov_C_Q_ratio <- Q_data_bn_temp %>%
+#   group_by(culture_id) %>%
+#   kruskal_test(C_Q_ratio ~ temperature)
+```
+
+### Instantaneous photobiology
+
+```{r}
+all_data %>%
+  type_convert() %>%
+  group_by(sample_filename) %>%
+  slice(1:180) %>%
+  mutate(x = row_number()) %>%
+  ungroup() %>%
+  filter(culture_id == "UTSD" | culture_id == "CCMP3420" | culture_id == "RT61") %>%
+  filter(PAR == 0) %>%
+  ggplot(aes(x, log(Tau2QA))) +
+  geom_point() +
+  facet_wrap(~sample_filename * temperature, scales = "free_x")
+
+inst_data_bn_temp <- data_ss %>%
+  select(sample_filename, sample_id, culture_id:curve_id, Fo, FqFm, Sig, PQP_Size, Tau1QA, Tau2QA) %>%
+  group_by(sample_filename, sample_id, culture_id, date, temperature, genus, ITS2_type, keep, temp_comparison, PAR_factor, curve_id) %>%
+  mutate(sigLHCII = Sig/FqFm,
+         t2_PQox = Tau2QA/PQP_Size) %>%
+  summarise(ss_FqFm = mean(FqFm),
+            ss_Sig = mean(Sig),
+            ss_PQP_Size = mean(PQP_Size),
+            ss_Tau1QA = mean(Tau1QA),
+            ss_Tau2QA = mean(Tau2QA),
+            ss_sigLHCII = mean(sigLHCII),
+            ss_t2_PQox = mean(t2_PQox)) %>%
+      filter(temp_comparison == "y") %>%
+  filter(culture_id != "SCF05804") %>%
+  filter(PAR_factor == 0.1) %>%
+  pivot_wider(id_cols = sample_filename:curve_id, names_from = PAR_factor, values_from = ss_FqFm:ss_t2_PQox) %>%
+  ungroup() %>%
+  select(culture_id, sample_id, ss_FqFm_0.1:ss_t2_PQox_0.1)
+```
+
+## PCA
+
+```{r}
+elementome_mmolEtoP_log_temp <- elementome_mmolEtoP %>%
+  filter(temp_comparison == "y") %>%
+  filter(culture_id != "SCF05804") %>%
+  mutate(across(N:Mo96, log))
+
+elementome_rda_temp <- elementome_mmolEtoP_log_temp %>%
+  column_to_rownames(var = "sample_id") %>%
+  select(N:Mo96)
+
+# zero mean
+elementome_rda_temp <- decostand(elementome_rda_temp, method = "standardize")
+
+# pca
+pca_temp <- rda(elementome_rda_temp)
+eig_temp <- eigenvals(pca_temp)
+eig_temp <- data.frame(summary(eig_temp))
+
+# extract the scores
+scrs_samples_temp <- as.data.frame(scores(pca_temp, display = "sites")) %>% # Extract scores
+  rownames_to_column(var = "sample_id")
+scrs_elements_temp <- as.data.frame(scores(pca_temp, display = "species")) %>% # Extract scores
+  rownames_to_column(var = "Elements")
+
+# create plot dataframe
+plot_df_temp <- left_join(elementome_mmolEtoP_log_temp, scrs_samples_temp) %>%
+  mutate(encircle = paste0(culture_id, "_", temperature))
+
+## Create ggplot figure
+Fig4b <- ggplot(plot_df_temp, aes(x = PC1, y = PC2)) +
+  geom_point(aes(fill = temperature, shape = culture_id), size = 4) +
+  geom_encircle(aes(group = encircle, fill = temperature), s_shape = 1, expand = 0, alpha = 0.2, show.legend = FALSE) +
+  geom_text(data = scrs_elements_temp, aes(x = PC1, y = PC2, label = Elements), size = 4) +
+  geom_segment(data = scrs_elements_temp, aes(x = 0, xend = PC1, y = 0, yend = PC2), size = 0.5, arrow = arrow(length = unit(0.25, "cm")), colour = "grey") +
+  scale_shape_manual(values = c(21,22,23)) +
+  theme(legend.position = "right", aspect.ratio = 1) +
+  scale_fill_manual(values = c("grey80", "red")) +
+  guides(fill = guide_legend(override.aes = list(shape = 21)))
+Fig4b
+```
+
+### PCA outputs
+
+```{r}
+# write_csv(eig_temp %>% rownames_to_column(var = "summary"), "eigenvals_cumulative_proportion_PCA_temp.csv")
+# write_csv(scrs_elements %>% mutate(PC1 = abs(PC1), PC2 = abs(PC2)) %>% arrange(desc(PC1)), "element_loadings_in_PCA_temp.csv")
+```
+
+### PCA loadings stats
+
+```{r}
+#PC1
+PC1_stats_temp <- plot_df_temp %>%
+  select(culture_id, temperature, PC1)
+
+PC1_sumstats <- PC1_stats %>%
+  group_by(culture_id) %>%
+  get_summary_stats(PC1, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(PC1 ~ culture_id * temperature, data = PC1_stats_temp)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS OK
+shapiro_test(residuals(model)) # LOOKS OK
+# Homogneity of variance assumption
+PC1_stats_temp %>% levene_test(PC1 ~ culture_id * temperature)
+# AOV
+PC1_aov_temp <- PC1_stats_temp %>% anova_test(PC1 ~ culture_id * temperature)
+PC1_pwc_temp <- PC1_stats_temp %>% tukey_hsd(PC1 ~ culture_id * temperature)
+
+#PC2
+PC2_stats_temp <- plot_df_temp %>%
+  select(culture_id, temperature, PC2)
+
+PC2_sumstats <- PC2_stats %>%
+  group_by(culture_id) %>%
+  get_summary_stats(PC2, type = "mean_sd")
+
+# Check norm
+## Build the linear model
+model  <- lm(PC2 ~ culture_id * temperature, data = PC2_stats_temp)
+## Create a QQ plot of residuals
+ggqqplot(residuals(model)) # LOOKS OK
+shapiro_test(residuals(model)) # LOOKS OK
+# Homogneity of variance assumption
+PC2_stats_temp %>% levene_test(PC2 ~ culture_id * temperature)
+# AOV
+PC2_aov_temp <- PC2_stats_temp %>% anova_test(PC2 ~ culture_id * temperature)
+PC2_pwc_temp <- PC2_stats_temp %>% tukey_hsd(PC2 ~ culture_id * temperature)
+
+write_csv(PC1_aov_temp, "PC1_anova_temp.csv")
+write_csv(PC2_aov_temp, "PC2_anova_temp.csv")
+
+write_csv(PC1_pwc_temp, "PC1_tukey_pwc_temperature.csv")
+write_csv(PC2_pwc_temp, "PC2_tukey_pwc_temperature.csv")
+```
+
+# All EP stats
+
+```{r}
+all_EP_stats_temp <- elementome_mmolEtoP_log_temp %>%
+  pivot_longer(names_to = "elements", cols = N:Mo96, values_to = "quota") %>%
+  group_by(elements) %>%
+  anova_test(quota ~ culture_id * temperature) %>%
+  adjust_pvalue()
+
+all_EP_tukey_temp <- elementome_mmolEtoP_log_temp %>%
+  pivot_longer(names_to = "elements", cols = N:Mo96, values_to = "quota") %>%
+  group_by(elements) %>%
+  tukey_hsd(quota ~ culture_id * temperature)
+
+write_csv(all_EP_stats_temp, "all_EP_temp_stats.csv")
+write_csv(all_EP_tukey_temp, "all_EP_temp_tukey.csv")
+```
+
+## Fig3
+
+```{r}
+Fig4a <- elementome_mmolEtoP %>%
+  filter(temp_comparison == "y") %>%
+  filter(culture_id != "SCF05804") %>%
+  select(culture_id, genus, temperature, C, N, P31) %>%
+  group_by(culture_id, temperature) %>%
+  summarise(mean_C = mean(C),
+            sd_C = sd(C),
+            mean_N = mean(N),
+            sd_N = sd(N),
+            mean_P = mean(P31),
+            sd_P = sd(P31)) %>%
+  ungroup() %>%
+  pivot_longer(names_to = "elements", cols = contains("mean")) %>%
+  mutate(label = paste0(culture_id, "_", temperature)) %>%
+  ggplot(aes(label, value)) +
+  geom_bar(aes(fill = temperature), stat = 'identity', position = "stack") +
+  geom_bar(stat="identity", fill="black", aes(alpha = fct_rev(elements))) +
+  scale_alpha_manual(values = c(0.4, 0.25, 0.05)) +
+  theme(aspect.ratio = 1) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), legend.position = "left") +
+  ylab("C:N:P (Mean)") +
+  xlab("Symbiodiniaceae culture") +
+  scale_fill_manual(values = c("grey80", "red"))
+
+Fig3a + Fig3b
+```
+
+```{r}
+Fig3c <- elementome_mmolEtoP %>%
+  filter(temp_comparison == "y") %>%
+  filter(culture_id != "SCF05804") %>%
+  select(-N, -C, -P31) %>%
+  pivot_longer(S32:Mo96, names_to = "elements", values_to = "quota") %>%
+  #select(culture_id, genus, temperature) %>%
+  group_by(culture_id, temperature, elements) %>%
+  summarise(mean_quota = mean(quota)) %>%
+  pivot_wider(names_from = temperature, values_from = mean_quota) %>%
+  mutate(fold = `31`/`27`) %>%
+  ggplot(aes(elements, fold)) + 
+  geom_point(aes(fill = culture_id,  shape = culture_id), position = position_dodge(width = 0.5), size = 4) + 
+  geom_linerange(aes(xmax = elements, ymax = fold, xmin = elements, ymin = 1, color = culture_id), position = position_dodge(width = 0.5)) +
+    scale_shape_manual(values = c(24,21,22)) +
+  coord_polar() +
+  geom_hline(yintercept = 1) +
+  ylim(0, 4.5)
+```
